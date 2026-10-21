@@ -237,14 +237,14 @@ contract YieldFarmingPoolTest is Test {
         vm.startPrank(user1);
         yieldFarmingPool.stake(poolId1, stakeAmount);
         
-        vm.expectRevert("Insufficient staked amount");
+        vm.expectRevert(abi.encodeWithSelector(InsufficientStakedAmount.selector, stakeAmount, stakeAmount + 1));
         yieldFarmingPool.withdraw(poolId1, stakeAmount + 1);
         vm.stopPrank();
     }
     
     function test_RevertWhen_ClaimNoRewards() public {
         vm.startPrank(user1);
-        vm.expectRevert("No rewards to claim");
+        vm.expectRevert(NoRewardsToClaim.selector);
         yieldFarmingPool.claimRewards(poolId1);
         vm.stopPrank();
     }
