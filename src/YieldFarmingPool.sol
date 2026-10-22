@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.24;
 
-import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
-import "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-import "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
-import "../lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol";
-import "../lib/openzeppelin-contracts/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,10 @@ error InvalidTokenAddress();
 
 /// @notice Thrown when a pool is created with a zero reward rate.
 error RewardRateMustBePositive();
+
+/// @notice Thrown when a reward rate exceeds the allowed maximum.
+/// @param provided The rejected reward rate.
+error RewardRateTooHigh(uint256 provided);
 
 /// @notice Thrown when trying to create a pool that already exists.
 /// @param poolId The identifier of the duplicate pool.
@@ -37,6 +41,14 @@ error InsufficientStakedAmount(uint256 available, uint256 requested);
 /// @notice Thrown when a user calls claimRewards with no pending rewards.
 error NoRewardsToClaim();
 
+/// @notice Thrown when the contract holds no reward tokens that are not user principal.
+error RewardBalanceDepleted();
+
+/// @notice Thrown when the owner tries to recover tokens that belong to stakers.
+/// @param requested The requested amount.
+/// @param withdrawable The maximum amount that can be recovered.
+error AmountExceedsWithdrawable(uint256 requested, uint256 withdrawable);
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 /// @title YieldFarmingPool
@@ -44,13 +56,22 @@ error NoRewardsToClaim();
 ///         a reward token distributed continuously via a per-token accumulator model.
 ///         Each pool is identified by a unique keccak256 hash of its parameters.
 /// @dev Uses a rewardPerTokenStored accumulator so reward calculation is O(1) per user
-///      regardless of how many stakers are in the pool.
+///      regardless of how many stakers are in the pool. Staked principal is tracked per token
+///      (`stakedByToken`) so neither reward payouts nor owner recoveries can touch it, even when a
+///      pool stakes the reward token itself. Rewards that cannot be paid because the contract is
+///      underfunded are kept as `unpaidRewards` and paid once the owner tops up the balance.
 contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
 
     // ─── Structs ──────────────────────────────────────────────────────────────
 
     /// @notice Stores the configuration and state of a staking pool.
+    /// @param token Staking token of the pool.
+    /// @param totalStaked Total amount currently staked.
+    /// @param rewardRate Reward tokens distributed per second across all stakers.
+    /// @param lastUpdateTime Timestamp of the last accumulator update.
+    /// @param rewardPerTokenStored Cumulative reward per staked token, scaled by 1e18.
+    /// @param isActive Whether the pool accepts stakes and claims.
     struct Pool {
         address token;
         uint256 totalStaked;
@@ -61,13 +82,21 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     }
 
     /// @notice Stores an individual user's position within a pool.
+    /// @param amount Staked token amount.
+    /// @param rewardDebt Rewards already accounted for at the last interaction.
+    /// @param lastClaimTime Timestamp of the last stake or claim.
+    /// @param unpaidRewards Earned rewards that could not be paid yet because of an underfunded balance.
     struct UserInfo {
         uint256 amount;
         uint256 rewardDebt;
         uint256 lastClaimTime;
+        uint256 unpaidRewards;
     }
 
     // ─── State ────────────────────────────────────────────────────────────────
+
+    /// @notice Highest reward rate (tokens per second, with token decimals) a pool may use.
+    uint256 public constant MAX_REWARD_RATE = 1e24;
 
     /// @notice The token paid out as staking rewards.
     IERC20 public immutable rewardToken;
@@ -77,6 +106,9 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
 
     /// @notice User position keyed by pool identifier then user address.
     mapping(bytes32 => mapping(address => UserInfo)) public userInfo;
+
+    /// @notice Total staked principal per token across all pools.
+    mapping(address => uint256) public stakedByToken;
 
     /// @notice Ordered list of all created pool identifiers.
     bytes32[] public activePools;
@@ -101,7 +133,7 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     /// @param amount Token amount withdrawn.
     event Withdrawn(bytes32 indexed poolId, address indexed user, uint256 amount);
 
-    /// @notice Emitted when pending rewards are paid to a user.
+    /// @notice Emitted when rewards are paid to a user. The amount is what was actually transferred.
     /// @param poolId Pool from which rewards were claimed.
     /// @param user Address of the recipient.
     /// @param amount Reward token amount transferred.
@@ -112,13 +144,18 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     /// @param newRewardRate The new reward rate per second.
     event PoolUpdated(bytes32 indexed poolId, uint256 newRewardRate);
 
+    /// @notice Emitted when the owner recovers tokens that do not belong to stakers.
+    /// @param token Recovered token.
+    /// @param amount Amount transferred to the owner.
+    event EmergencyWithdrawn(address indexed token, uint256 amount);
+
     // ─── Constructor ──────────────────────────────────────────────────────────
 
     /// @notice Deploys the contract and sets the reward token.
-    /// @param _rewardToken Address of the ERC20 token paid out as rewards.
-    constructor(address _rewardToken) Ownable(msg.sender) {
-        if (_rewardToken == address(0)) revert InvalidRewardToken();
-        rewardToken = IERC20(_rewardToken);
+    /// @param rewardToken_ Address of the ERC20 token paid out as rewards.
+    constructor(address rewardToken_) Ownable(msg.sender) {
+        if (rewardToken_ == address(0)) revert InvalidRewardToken();
+        rewardToken = IERC20(rewardToken_);
     }
 
     // ─── Owner functions ──────────────────────────────────────────────────────
@@ -137,15 +174,12 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     /// @dev Pool ID is derived from keccak256(token, rewardRate, timestamp, chainId)
     ///      to guarantee uniqueness across chains and time.
     /// @param token Address of the ERC20 token users will stake.
-    /// @param rewardRate Reward tokens distributed per second across all stakers.
+    /// @param rewardRate Reward tokens distributed per second across all stakers (at most `MAX_REWARD_RATE`).
     /// @return poolId Unique identifier for the created pool.
-    function createPool(address token, uint256 rewardRate)
-        external
-        onlyOwner
-        returns (bytes32 poolId)
-    {
+    function createPool(address token, uint256 rewardRate) external onlyOwner returns (bytes32 poolId) {
         if (token == address(0)) revert InvalidTokenAddress();
         if (rewardRate == 0) revert RewardRateMustBePositive();
+        if (rewardRate > MAX_REWARD_RATE) revert RewardRateTooHigh(rewardRate);
 
         poolId = keccak256(abi.encodePacked(token, rewardRate, block.timestamp, block.chainid));
 
@@ -167,10 +201,12 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
 
     /// @notice Updates the reward rate of an existing pool.
     /// @dev Settles accumulated rewards up to this point before changing the rate.
+    ///      A rate of zero stops the emission of the pool without closing it.
     /// @param poolId Identifier of the pool to update.
-    /// @param newRewardRate New reward tokens distributed per second.
+    /// @param newRewardRate New reward tokens distributed per second (at most `MAX_REWARD_RATE`).
     function updatePoolRewardRate(bytes32 poolId, uint256 newRewardRate) external onlyOwner {
         if (!pools[poolId].isActive) revert PoolNotActive(poolId);
+        if (newRewardRate > MAX_REWARD_RATE) revert RewardRateTooHigh(newRewardRate);
 
         _updatePool(poolId);
         pools[poolId].rewardRate = newRewardRate;
@@ -178,19 +214,25 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
         emit PoolUpdated(poolId, newRewardRate);
     }
 
-    /// @notice Recovers any ERC20 token held by this contract.
+    /// @notice Recovers tokens held by this contract that are not staked principal.
+    /// @dev Staked tokens can never be recovered. For the reward token this means the unspent reward
+    ///      balance can be reclaimed, so the owner is trusted to keep the contract funded.
     /// @param token Address of the token to recover.
     /// @param amount Amount to transfer to the owner.
-    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner nonReentrant {
+        uint256 withdrawable = IERC20(token).balanceOf(address(this)) - stakedByToken[token];
+        if (amount > withdrawable) revert AmountExceedsWithdrawable(amount, withdrawable);
+
         IERC20(token).safeTransfer(owner(), amount);
+
+        emit EmergencyWithdrawn(token, amount);
     }
 
     // ─── User functions ───────────────────────────────────────────────────────
 
     /// @notice Stakes tokens into a pool.
-    /// @dev If the caller already has a position, pending rewards are paid out first
-    ///      so that rewardDebt can be reset cleanly against the new balance.
-    ///      Follows CEI: state is updated before the external token transfer.
+    /// @dev Pending rewards are settled and paid in the same call so that rewardDebt can be reset
+    ///      against the new balance. State is fully updated before any external transfer.
     /// @param poolId Identifier of the pool to stake into.
     /// @param amount Token amount to stake.
     function stake(bytes32 poolId, uint256 amount) external nonReentrant whenNotPaused {
@@ -202,19 +244,19 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
         Pool storage pool = pools[poolId];
         UserInfo storage user = userInfo[poolId][msg.sender];
 
-        if (user.amount > 0) {
-            uint256 pending = _calculatePendingRewards(poolId, msg.sender);
-            if (pending > 0) {
-                _safeRewardTransfer(msg.sender, pending);
-                emit RewardClaimed(poolId, msg.sender, pending);
-            }
-        }
+        uint256 pending = _calculatePendingRewards(poolId, msg.sender);
+        uint256 paid = _settlePayout(user, pending);
 
         user.amount += amount;
         user.rewardDebt = user.amount * pool.rewardPerTokenStored / 1e18;
         user.lastClaimTime = block.timestamp;
         pool.totalStaked += amount;
+        stakedByToken[pool.token] += amount;
 
+        if (paid > 0) {
+            rewardToken.safeTransfer(msg.sender, paid);
+            emit RewardClaimed(poolId, msg.sender, paid);
+        }
         IERC20(pool.token).safeTransferFrom(msg.sender, address(this), amount);
 
         emit Staked(poolId, msg.sender, amount);
@@ -222,9 +264,9 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
 
     /// @notice Withdraws staked tokens from a pool.
     /// @dev Always available even when paused so users can never be locked in.
-    ///      Pending rewards are paid alongside the withdrawal.
-    ///      Follows CEI: all state is updated before external transfers.
-    ///      If the user withdraws their full position, the UserInfo slot is deleted.
+    ///      Pending rewards are paid alongside the withdrawal, capped at the available reward balance
+    ///      (the rest stays as `unpaidRewards`). If the position is fully withdrawn and nothing is
+    ///      owed, the UserInfo slot is deleted.
     /// @param poolId Identifier of the pool to withdraw from.
     /// @param amount Token amount to withdraw.
     function withdraw(bytes32 poolId, uint256 amount) external nonReentrant {
@@ -237,29 +279,30 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
 
         Pool storage pool = pools[poolId];
         uint256 pending = _calculatePendingRewards(poolId, msg.sender);
+        uint256 paid = _settlePayout(user, pending);
 
         user.amount -= amount;
+        user.rewardDebt = user.amount * pool.rewardPerTokenStored / 1e18;
         pool.totalStaked -= amount;
+        stakedByToken[pool.token] -= amount;
 
-        if (user.amount == 0) {
-            delete userInfo[poolId][msg.sender];
-        } else {
-            user.rewardDebt = user.amount * pool.rewardPerTokenStored / 1e18;
+        if (user.amount == 0 && user.unpaidRewards == 0) delete userInfo[poolId][msg.sender];
+
+        if (paid > 0) {
+            rewardToken.safeTransfer(msg.sender, paid);
+            emit RewardClaimed(poolId, msg.sender, paid);
         }
-
-        if (pending > 0) {
-            _safeRewardTransfer(msg.sender, pending);
-            emit RewardClaimed(poolId, msg.sender, pending);
-        }
-
         IERC20(pool.token).safeTransfer(msg.sender, amount);
 
         emit Withdrawn(poolId, msg.sender, amount);
     }
 
     /// @notice Claims all pending rewards for the caller in a given pool.
+    /// @dev Reverts with {RewardBalanceDepleted} when nothing can be paid, so no rewards are lost.
     /// @param poolId Identifier of the pool to claim from.
     function claimRewards(bytes32 poolId) external nonReentrant whenNotPaused {
+        if (!pools[poolId].isActive) revert PoolNotActive(poolId);
+
         _updatePool(poolId);
 
         uint256 pending = _calculatePendingRewards(poolId, msg.sender);
@@ -269,9 +312,12 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
         user.rewardDebt = user.amount * pools[poolId].rewardPerTokenStored / 1e18;
         user.lastClaimTime = block.timestamp;
 
-        _safeRewardTransfer(msg.sender, pending);
+        uint256 paid = _settlePayout(user, pending);
+        if (paid == 0) revert RewardBalanceDepleted();
 
-        emit RewardClaimed(poolId, msg.sender, pending);
+        rewardToken.safeTransfer(msg.sender, paid);
+
+        emit RewardClaimed(poolId, msg.sender, paid);
     }
 
     // ─── View functions ───────────────────────────────────────────────────────
@@ -279,7 +325,7 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     /// @notice Returns the pending reward amount for a user in a pool.
     /// @param poolId Identifier of the pool.
     /// @param user Address of the user.
-    /// @return Reward token amount claimable right now.
+    /// @return Reward token amount earned, including any previously unpaid rewards.
     function pendingRewards(bytes32 poolId, address user) external view returns (uint256) {
         Pool storage pool = pools[poolId];
         UserInfo storage userInfoData = userInfo[poolId][user];
@@ -291,15 +337,17 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
             rewardPerTokenStored += timeElapsed * pool.rewardRate * 1e18 / pool.totalStaked;
         }
 
-        return userInfoData.amount * rewardPerTokenStored / 1e18 - userInfoData.rewardDebt;
+        return userInfoData.amount * rewardPerTokenStored / 1e18 - userInfoData.rewardDebt + userInfoData.unpaidRewards;
     }
 
     /// @notice Returns the number of pools that have been created.
+    /// @return Length of the pool list.
     function getActivePoolsCount() external view returns (uint256) {
         return activePools.length;
     }
 
     /// @notice Returns all pool identifiers.
+    /// @return All pool identifiers in creation order.
     function getActivePools() external view returns (bytes32[] memory) {
         return activePools;
     }
@@ -310,12 +358,7 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
     function getPoolEncodedData(bytes32 poolId) external view returns (bytes memory encodedData) {
         Pool storage pool = pools[poolId];
         encodedData = abi.encodePacked(
-            pool.token,
-            pool.totalStaked,
-            pool.rewardRate,
-            pool.lastUpdateTime,
-            pool.rewardPerTokenStored,
-            pool.isActive
+            pool.token, pool.totalStaked, pool.rewardRate, pool.lastUpdateTime, pool.rewardPerTokenStored, pool.isActive
         );
     }
 
@@ -329,8 +372,8 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
 
     // ─── Internal ─────────────────────────────────────────────────────────────
 
-    /// @notice Settles all rewards generated by the pool since the last update.
-    /// @dev Must be called before any operation that reads or writes user balances.
+    /// @dev Settles all rewards generated by the pool since the last update.
+    ///      Must be called before any operation that reads or writes user balances.
     /// @param poolId Identifier of the pool to settle.
     function _updatePool(bytes32 poolId) internal {
         Pool storage pool = pools[poolId];
@@ -343,29 +386,29 @@ contract YieldFarmingPool is ReentrancyGuard, Ownable2Step, Pausable {
         pool.lastUpdateTime = block.timestamp;
     }
 
-    /// @notice Calculates the rewards a user has earned but not yet claimed.
-    /// @dev Reads the already-settled rewardPerTokenStored — call _updatePool first.
+    /// @dev Rewards a user has earned but not yet received, including previously unpaid rewards.
+    ///      Reads the already-settled rewardPerTokenStored, so call _updatePool first.
     /// @param poolId Identifier of the pool.
     /// @param user Address of the user.
     /// @return Pending reward token amount.
     function _calculatePendingRewards(bytes32 poolId, address user) internal view returns (uint256) {
         Pool storage pool = pools[poolId];
         UserInfo storage userInfoData = userInfo[poolId][user];
-        return userInfoData.amount * pool.rewardPerTokenStored / 1e18 - userInfoData.rewardDebt;
+        return
+            userInfoData.amount * pool.rewardPerTokenStored / 1e18 - userInfoData.rewardDebt
+                + userInfoData.unpaidRewards;
     }
 
-    /// @notice Transfers reward tokens to a recipient, capped at the available balance.
-    /// @dev Caps the transfer instead of reverting to avoid blocking withdrawals when
-    ///      the reward balance runs low. The uncovered amount is not tracked as debt.
-    /// @param to Recipient address.
-    /// @param amount Desired reward amount.
-    function _safeRewardTransfer(address to, uint256 amount) internal {
-        uint256 rewardBalance = rewardToken.balanceOf(address(this));
-        if (amount > rewardBalance) {
-            amount = rewardBalance;
-        }
-        if (amount > 0) {
-            rewardToken.safeTransfer(to, amount);
-        }
+    /// @dev Decides how much of `pending` can be paid now and records the rest as unpaid.
+    ///      Must run before `stakedByToken` changes in the same call, so the principal being staked or
+    ///      withdrawn is never counted as available reward balance. Only updates storage; the caller
+    ///      performs the transfer afterwards.
+    /// @param user Storage pointer to the user position.
+    /// @param pending Total amount owed to the user.
+    /// @return paid Amount that can be transferred now.
+    function _settlePayout(UserInfo storage user, uint256 pending) internal returns (uint256 paid) {
+        uint256 available = rewardToken.balanceOf(address(this)) - stakedByToken[address(rewardToken)];
+        paid = pending > available ? available : pending;
+        user.unpaidRewards = pending - paid;
     }
 }
