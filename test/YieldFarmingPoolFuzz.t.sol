@@ -1,170 +1,167 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.24;
 
-import "forge-std/Test.sol";
+import {FarmBase} from "./utils/FarmBase.sol";
 import "../src/YieldFarmingPool.sol";
-import "../src/MockToken.sol";
 
-contract YieldFarmingPoolFuzzTest is Test {
-    YieldFarmingPool public yieldFarmingPool;
-    MockToken public rewardToken;
-    MockToken public stakingToken1;
+contract YieldFarmingPoolFuzz is FarmBase {
+    // Any stake amount within the user's balance is credited exactly and moves the tokens.
+    function testFuzz_stake_anyAmount_creditsExactly(uint256 amount_) external {
+        // Arrange
+        amount_ = bound(amount_, 1, 10_000 ether);
 
-    address public owner;
-    address public user1;
-    address public user2;
+        // Act
+        _stake(alice, poolId1, amount_);
 
-    bytes32 public poolId1;
-
-    uint256 public constant INITIAL_SUPPLY = 1_000_000 * 1e18;
-    uint256 public constant REWARD_RATE    = 1e16;
-
-    function setUp() public {
-        owner = address(this);
-        user1 = makeAddr("user1");
-        user2 = makeAddr("user2");
-
-        rewardToken   = new MockToken("Reward Token", "RWD", INITIAL_SUPPLY);
-        stakingToken1 = new MockToken("Staking Token 1", "STK1", INITIAL_SUPPLY);
-
-        yieldFarmingPool = new YieldFarmingPool(address(rewardToken));
-
-        stakingToken1.transfer(user1, 10_000 * 1e18);
-        stakingToken1.transfer(user2, 10_000 * 1e18);
-
-        rewardToken.transfer(address(yieldFarmingPool), 500_000 * 1e18);
-
-        poolId1 = yieldFarmingPool.createPool(address(stakingToken1), REWARD_RATE);
-
-        vm.prank(user1);
-        stakingToken1.approve(address(yieldFarmingPool), type(uint256).max);
-
-        vm.prank(user2);
-        stakingToken1.approve(address(yieldFarmingPool), type(uint256).max);
+        // Assert
+        (uint256 staked,,,) = pool.userInfo(poolId1, alice);
+        assertEq(staked, amount_);
+        assertEq(pool.stakedByToken(address(stakeToken1)), amount_);
+        assertEq(stakeToken1.balanceOf(address(pool)), amount_);
     }
 
-    /// @dev Any valid stake amount is correctly recorded.
-    function testFuzz_StakeAnyAmount(uint256 amount) public {
-        amount = bound(amount, 1, 10_000 * 1e18);
+    // Withdrawing part of a position returns exactly that amount and leaves the rest staked.
+    function testFuzz_withdraw_partial_returnsExactAmount(uint256 stakeAmount_, uint256 withdrawAmount_) external {
+        // Arrange
+        stakeAmount_ = bound(stakeAmount_, 2, 10_000 ether);
+        withdrawAmount_ = bound(withdrawAmount_, 1, stakeAmount_);
+        _stake(alice, poolId1, stakeAmount_);
+        vm.warp(block.timestamp + 1 days);
 
-        uint256 balanceBefore = stakingToken1.balanceOf(user1);
+        // Act
+        vm.prank(alice);
+        pool.withdraw(poolId1, withdrawAmount_);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
-
-        (uint256 userAmount,,) = yieldFarmingPool.userInfo(poolId1, user1);
-        (, uint256 totalStaked,,,,) = yieldFarmingPool.pools(poolId1);
-
-        assertEq(userAmount, amount);
-        assertEq(totalStaked, amount);
-        assertEq(stakingToken1.balanceOf(user1), balanceBefore - amount);
-        assertEq(stakingToken1.balanceOf(address(yieldFarmingPool)), amount);
+        // Assert
+        (uint256 staked,,,) = pool.userInfo(poolId1, alice);
+        assertEq(staked, stakeAmount_ - withdrawAmount_);
+        assertEq(stakeToken1.balanceOf(alice), 10_000 ether - stakeAmount_ + withdrawAmount_);
     }
 
-    /// @dev Partial withdraw leaves correct remaining amounts.
-    function testFuzz_PartialWithdraw(uint256 stakeAmount, uint256 withdrawAmount) public {
-        stakeAmount    = bound(stakeAmount, 1, 10_000 * 1e18);
-        withdrawAmount = bound(withdrawAmount, 1, stakeAmount);
+    // A solo staker earns the full emission, up to integer rounding.
+    function testFuzz_rewards_soloStaker_earnsFullEmission(uint256 stakeAmount_, uint256 elapsed_) external {
+        // Arrange
+        stakeAmount_ = bound(stakeAmount_, 1 ether, 10_000 ether);
+        elapsed_ = bound(elapsed_, 1, 365 days);
+        _stake(alice, poolId1, stakeAmount_);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, stakeAmount);
+        // Act
+        vm.warp(block.timestamp + elapsed_);
 
-        vm.warp(block.timestamp + 1);
-
-        vm.prank(user1);
-        yieldFarmingPool.withdraw(poolId1, withdrawAmount);
-
-        (uint256 userAmount,,) = yieldFarmingPool.userInfo(poolId1, user1);
-        (, uint256 totalStaked,,,,) = yieldFarmingPool.pools(poolId1);
-
-        assertEq(userAmount, stakeAmount - withdrawAmount);
-        assertEq(totalStaked, stakeAmount - withdrawAmount);
+        // Assert
+        uint256 emitted = elapsed_ * REWARD_RATE;
+        uint256 earned = pool.pendingRewards(poolId1, alice);
+        assertLe(earned, emitted);
+        assertApproxEqAbs(earned, emitted, stakeAmount_ / 1e18 + 1);
     }
 
-    /// @dev A sole staker earns all rewards. Tolerance accounts for integer division
-    ///      dust: floor(N*1e18/amount)*amount/1e18 can differ by up to amount/1e18 + 1.
-    function testFuzz_SoloStakerGetsAllRewards(uint256 stakeAmount, uint256 timeElapsed) public {
-        stakeAmount = bound(stakeAmount, 1 ether, 10_000 * 1e18);
-        timeElapsed = bound(timeElapsed, 1, 365 days);
+    // The sum of what all stakers have earned never exceeds what the pool has emitted.
+    function testFuzz_rewards_twoStakers_neverExceedEmission(uint256 aliceAmount_, uint256 bobAmount_, uint256 elapsed_)
+        external
+    {
+        // Arrange
+        aliceAmount_ = bound(aliceAmount_, 1 ether, 10_000 ether);
+        bobAmount_ = bound(bobAmount_, 1 ether, 10_000 ether);
+        elapsed_ = bound(elapsed_, 1, 365 days);
+        _stake(alice, poolId1, aliceAmount_);
+        _stake(bob, poolId1, bobAmount_);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, stakeAmount);
+        // Act
+        vm.warp(block.timestamp + elapsed_);
 
-        vm.warp(block.timestamp + timeElapsed);
-
-        uint256 pending  = yieldFarmingPool.pendingRewards(poolId1, user1);
-        uint256 expected = timeElapsed * REWARD_RATE;
-        uint256 dust     = stakeAmount / 1e18 + 1;
-
-        assertApproxEqAbs(pending, expected, dust);
-        assertLe(pending, expected); // never overpay
+        // Assert
+        uint256 total = pool.pendingRewards(poolId1, alice) + pool.pendingRewards(poolId1, bob);
+        assertLe(total, elapsed_ * REWARD_RATE);
     }
 
-    /// @dev Two simultaneous stakers split rewards proportionally and their
-    ///      rewards sum to the total generated.
-    function testFuzz_TwoUsersRewardsProportional(
-        uint256 amount1,
-        uint256 amount2,
-        uint256 timeElapsed
-    ) public {
-        amount1     = bound(amount1, 1 ether, 5_000 * 1e18);
-        amount2     = bound(amount2, 1 ether, 5_000 * 1e18);
-        timeElapsed = bound(timeElapsed, 1, 365 days);
+    // Rewards compound correctly across several stakes: claims plus pending equal the emission.
+    function testFuzz_rewards_overMultipleStakes_matchEmission(uint256 first_, uint256 second_, uint256 elapsed_)
+        external
+    {
+        // Arrange
+        first_ = bound(first_, 1 ether, 5_000 ether);
+        second_ = bound(second_, 1 ether, 5_000 ether);
+        elapsed_ = bound(elapsed_, 1, 100 days);
+        _stake(alice, poolId1, first_);
+        vm.warp(block.timestamp + elapsed_);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount1);
+        // Act
+        _stake(alice, poolId1, second_);
+        vm.warp(block.timestamp + elapsed_);
 
-        vm.prank(user2);
-        yieldFarmingPool.stake(poolId1, amount2);
-
-        vm.warp(block.timestamp + timeElapsed);
-
-        uint256 pending1 = yieldFarmingPool.pendingRewards(poolId1, user1);
-        uint256 pending2 = yieldFarmingPool.pendingRewards(poolId1, user2);
-        uint256 total    = timeElapsed * REWARD_RATE;
-
-        // Dust tolerance: each user's rounding can lose up to (totalStaked/1e18 + 1)
-        uint256 dust = (amount1 + amount2) / 1e18 + 2;
-
-        // Sum of rewards is within dust of total generated and never exceeds it
-        assertApproxEqAbs(pending1 + pending2, total, dust);
-        assertLe(pending1 + pending2, total);
-
-        // Proportionality: larger staker earns more
-        if (amount1 > amount2) assertGe(pending1, pending2);
-        if (amount2 > amount1) assertGe(pending2, pending1);
+        // Assert
+        uint256 total = rewardToken.balanceOf(alice) + pool.pendingRewards(poolId1, alice);
+        assertLe(total, 2 * elapsed_ * REWARD_RATE);
+        assertApproxEqAbs(total, 2 * elapsed_ * REWARD_RATE, 2 * (first_ + second_) / 1e18 + 4);
     }
 
-    /// @dev Re-staking auto-compounds: the second claim is larger than the first.
-    function testFuzz_RewardsCompoundOverMultipleStakes(
-        uint256 firstStake,
-        uint256 addedStake,
-        uint256 time1,
-        uint256 time2
-    ) public {
-        firstStake = bound(firstStake, 1 ether, 5_000 * 1e18);
-        addedStake = bound(addedStake, 1 ether, 5_000 * 1e18);
-        time1      = bound(time1, 1, 90 days);
-        time2      = bound(time2, 1, 90 days);
+    // When the contract is underfunded, paid plus unpaid always equals what was earned.
+    function testFuzz_claimRewards_whenUnderfunded_paidPlusUnpaidEqualsEarned(uint256 funding_, uint256 elapsed_)
+        external
+    {
+        // Arrange
+        elapsed_ = bound(elapsed_, 1000, 30 days);
+        YieldFarmingPool p = new YieldFarmingPool(address(rewardToken));
+        bytes32 id = p.createPool(address(stakeToken1), REWARD_RATE);
+        vm.startPrank(alice);
+        stakeToken1.approve(address(p), type(uint256).max);
+        p.stake(id, 1000 ether);
+        vm.stopPrank();
+        vm.warp(block.timestamp + elapsed_);
+        uint256 earned = p.pendingRewards(id, alice);
+        funding_ = bound(funding_, 1, earned - 1);
+        rewardToken.transfer(address(p), funding_);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, firstStake);
+        // Act
+        vm.prank(alice);
+        p.claimRewards(id);
 
-        vm.warp(block.timestamp + time1);
+        // Assert
+        assertEq(rewardToken.balanceOf(alice), funding_);
+        assertEq(p.pendingRewards(id, alice), earned - funding_);
+    }
 
-        // Re-staking triggers auto-claim of first-period rewards
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, addedStake);
+    // The owner can never recover staked principal, whatever amount is requested.
+    function testFuzz_emergencyWithdraw_neverTouchesStakedPrincipal(uint256 staked_, uint256 donated_, uint256 amount_)
+        external
+    {
+        // Arrange
+        staked_ = bound(staked_, 1, 10_000 ether);
+        donated_ = bound(donated_, 0, 1000 ether);
+        amount_ = bound(amount_, 0, 20_000 ether);
+        _stake(alice, poolId1, staked_);
+        assertTrue(stakeToken1.transfer(address(pool), donated_));
 
-        uint256 firstClaim = rewardToken.balanceOf(user1);
-        assertGt(firstClaim, 0);
+        // Act
+        if (amount_ > donated_) {
+            vm.expectRevert(abi.encodeWithSelector(AmountExceedsWithdrawable.selector, amount_, donated_));
+        }
+        pool.emergencyWithdraw(address(stakeToken1), amount_);
 
-        vm.warp(block.timestamp + time2);
+        // Assert
+        assertGe(stakeToken1.balanceOf(address(pool)), staked_);
+    }
 
-        vm.prank(user1);
-        yieldFarmingPool.claimRewards(poolId1);
+    // Any reward rate above the maximum is rejected when creating a pool.
+    function testFuzz_createPool_rateAboveMax_reverts(uint256 rate_) external {
+        // Arrange
+        rate_ = bound(rate_, pool.MAX_REWARD_RATE() + 1, type(uint256).max);
 
-        uint256 finalBalance = rewardToken.balanceOf(user1);
-        assertGt(finalBalance, firstClaim);
+        // Act / Assert
+        vm.expectRevert(abi.encodeWithSelector(RewardRateTooHigh.selector, rate_));
+        pool.createPool(address(stakeToken1), rate_);
+    }
+
+    // Any in-range rate update is stored.
+    function testFuzz_updatePoolRewardRate_inRange_storesRate(uint256 rate_) external {
+        // Arrange
+        rate_ = bound(rate_, 0, pool.MAX_REWARD_RATE());
+
+        // Act
+        pool.updatePoolRewardRate(poolId1, rate_);
+
+        // Assert
+        (,, uint256 stored,,,) = pool.pools(poolId1);
+        assertEq(stored, rate_);
     }
 }

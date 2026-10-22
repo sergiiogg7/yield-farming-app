@@ -1,460 +1,716 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.24;
 
-import "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {FarmBase} from "./utils/FarmBase.sol";
+import {MockToken} from "./mocks/MockToken.sol";
 import "../src/YieldFarmingPool.sol";
-import "../src/MockToken.sol";
 
-// OZ errors declared locally so they are in scope for expectRevert selectors
-error OwnableUnauthorizedAccount(address account);
-error EnforcedPause();
+/// @dev Staking token that re-enters `stake` from inside `transferFrom`.
+contract ReentrantStakeToken is ERC20 {
+    YieldFarmingPool public pool;
+    bytes32 public poolId;
 
-contract YieldFarmingPoolTest is Test {
-    YieldFarmingPool public yieldFarmingPool;
-    MockToken public rewardToken;
-    MockToken public stakingToken1;
-    MockToken public stakingToken2;
+    constructor() ERC20("Evil", "EVIL") {}
 
-    address public owner;
-    address public user1;
-    address public user2;
-    address public user3;
-
-    bytes32 public poolId1;
-    bytes32 public poolId2;
-
-    uint256 public constant INITIAL_SUPPLY = 1_000_000 * 1e18;
-    uint256 public constant REWARD_RATE = 1e16;
-
-    function setUp() public {
-        owner = address(this);
-        user1 = makeAddr("user1");
-        user2 = makeAddr("user2");
-        user3 = makeAddr("user3");
-
-        rewardToken   = new MockToken("Reward Token", "RWD", INITIAL_SUPPLY);
-        stakingToken1 = new MockToken("Staking Token 1", "STK1", INITIAL_SUPPLY);
-        stakingToken2 = new MockToken("Staking Token 2", "STK2", INITIAL_SUPPLY);
-
-        yieldFarmingPool = new YieldFarmingPool(address(rewardToken));
-
-        stakingToken1.transfer(user1, 10_000 * 1e18);
-        stakingToken1.transfer(user2, 10_000 * 1e18);
-        stakingToken2.transfer(user1, 10_000 * 1e18);
-        stakingToken2.transfer(user3, 10_000 * 1e18);
-
-        rewardToken.transfer(address(yieldFarmingPool), 500_000 * 1e18);
-
-        poolId1 = yieldFarmingPool.createPool(address(stakingToken1), REWARD_RATE);
-        poolId2 = yieldFarmingPool.createPool(address(stakingToken2), REWARD_RATE * 2);
-
-        vm.startPrank(user1);
-        stakingToken1.approve(address(yieldFarmingPool), type(uint256).max);
-        stakingToken2.approve(address(yieldFarmingPool), type(uint256).max);
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        stakingToken1.approve(address(yieldFarmingPool), type(uint256).max);
-        vm.stopPrank();
-
-        vm.startPrank(user3);
-        stakingToken2.approve(address(yieldFarmingPool), type(uint256).max);
-        vm.stopPrank();
+    function setTarget(YieldFarmingPool pool_, bytes32 poolId_) external {
+        pool = pool_;
+        poolId = poolId_;
     }
 
-    // ─── Constructor ──────────────────────────────────────────────────────────
+    function mint(address to_, uint256 amount_) external {
+        _mint(to_, amount_);
+    }
 
-    function test_RevertWhen_ConstructorZeroRewardToken() public {
+    function transferFrom(address from_, address to_, uint256 amount_) public override returns (bool) {
+        pool.stake(poolId, 1);
+        return super.transferFrom(from_, to_, amount_);
+    }
+}
+
+contract YieldFarmingPoolTest is FarmBase {
+    // -------------------------------------------------------------------------
+    // constructor
+    // -------------------------------------------------------------------------
+
+    function test_constructor_withZeroRewardToken_revertsWithInvalidRewardToken() external {
+        // Arrange / Act / Assert
         vm.expectRevert(InvalidRewardToken.selector);
         new YieldFarmingPool(address(0));
     }
 
-    // ─── createPool ───────────────────────────────────────────────────────────
-
-    function testCreatePool() public {
-        (address token1,, uint256 rewardRate1,,, bool isActive1) = yieldFarmingPool.pools(poolId1);
-        (address token2,, uint256 rewardRate2,,, bool isActive2) = yieldFarmingPool.pools(poolId2);
-
-        assertTrue(isActive1);
-        assertTrue(isActive2);
-        assertEq(token1, address(stakingToken1));
-        assertEq(token2, address(stakingToken2));
-        assertEq(rewardRate1, REWARD_RATE);
-        assertEq(rewardRate2, REWARD_RATE * 2);
+    function test_constructor_setsRewardTokenAndOwner() external view {
+        // Assert
+        assertEq(address(pool.rewardToken()), address(rewardToken));
+        assertEq(pool.owner(), address(this));
     }
 
-    function test_RevertWhen_CreatePoolZeroToken() public {
+    // -------------------------------------------------------------------------
+    // createPool
+    // -------------------------------------------------------------------------
+
+    function test_createPool_storesPoolAndEmits() external {
+        // Arrange
+        MockToken token = new MockToken("T", "T", 1);
+        bytes32 expectedId = keccak256(abi.encodePacked(address(token), uint256(5), block.timestamp, block.chainid));
+        vm.expectEmit(true, true, false, true);
+        emit YieldFarmingPool.PoolCreated(expectedId, address(token), 5);
+
+        // Act
+        bytes32 id = pool.createPool(address(token), 5);
+
+        // Assert
+        assertEq(id, expectedId);
+        (address t, uint256 totalStaked, uint256 rate, uint256 last, uint256 rpt, bool active) = pool.pools(id);
+        assertEq(t, address(token));
+        assertEq(totalStaked, 0);
+        assertEq(rate, 5);
+        assertEq(last, block.timestamp);
+        assertEq(rpt, 0);
+        assertTrue(active);
+        assertEq(pool.getActivePoolsCount(), 3);
+        assertEq(pool.activePools(2), id);
+    }
+
+    function test_createPool_withZeroToken_revertsWithInvalidTokenAddress() external {
+        // Arrange / Act / Assert
         vm.expectRevert(InvalidTokenAddress.selector);
-        yieldFarmingPool.createPool(address(0), REWARD_RATE);
+        pool.createPool(address(0), 1);
     }
 
-    function test_RevertWhen_CreatePoolZeroRate() public {
+    function test_createPool_withZeroRate_revertsWithRewardRateMustBePositive() external {
+        // Arrange / Act / Assert
         vm.expectRevert(RewardRateMustBePositive.selector);
-        yieldFarmingPool.createPool(address(stakingToken1), 0);
+        pool.createPool(address(stakeToken1), 0);
     }
 
-    function test_RevertWhen_CreatePoolNotOwner() public {
-        vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OwnableUnauthorizedAccount.selector, user1));
-        yieldFarmingPool.createPool(address(stakingToken1), REWARD_RATE);
+    function test_createPool_withRateAboveMax_revertsWithRewardRateTooHigh() external {
+        // Arrange
+        uint256 tooHigh = pool.MAX_REWARD_RATE() + 1;
+
+        // Act / Assert
+        vm.expectRevert(abi.encodeWithSelector(RewardRateTooHigh.selector, tooHigh));
+        pool.createPool(address(stakeToken1), tooHigh);
     }
 
-    function test_RevertWhen_CreatePoolAlreadyExists() public {
-        // Same block.timestamp as setUp → same poolId
-        bytes32 expectedId = keccak256(
-            abi.encodePacked(address(stakingToken1), REWARD_RATE, block.timestamp, block.chainid)
-        );
-        vm.expectRevert(abi.encodeWithSelector(PoolAlreadyExists.selector, expectedId));
-        yieldFarmingPool.createPool(address(stakingToken1), REWARD_RATE);
+    function test_createPool_byNonOwner_reverts() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pool.createPool(address(stakeToken1), 1);
     }
 
-    function testPoolIdUniqueness() public {
-        assertTrue(poolId1 != poolId2);
+    function test_createPool_withSameParametersInSameBlock_revertsWithPoolAlreadyExists() external {
+        // Arrange / Act / Assert
+        vm.expectRevert(abi.encodeWithSelector(PoolAlreadyExists.selector, poolId1));
+        pool.createPool(address(stakeToken1), REWARD_RATE);
+    }
 
+    function test_createPool_withSameParametersLater_createsDistinctPool() external {
+        // Arrange
         vm.warp(block.timestamp + 1);
-        bytes32 poolId3 = yieldFarmingPool.createPool(address(stakingToken1), REWARD_RATE);
-        assertTrue(poolId1 != poolId3);
+
+        // Act
+        bytes32 later = pool.createPool(address(stakeToken1), REWARD_RATE);
+
+        // Assert
+        assertTrue(later != poolId1);
     }
 
-    // ─── Pause / Unpause ──────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // updatePoolRewardRate
+    // -------------------------------------------------------------------------
 
-    function testPauseUnpause() public {
-        yieldFarmingPool.pause();
-        assertTrue(yieldFarmingPool.paused());
+    function test_updatePoolRewardRate_settlesBeforeChangingRate() external {
+        // Arrange: 1000 tokens staked for 100s at the old rate
+        _stake(alice, poolId1, 1000 ether);
+        vm.warp(block.timestamp + 100);
 
-        yieldFarmingPool.unpause();
-        assertFalse(yieldFarmingPool.paused());
+        // Act
+        vm.expectEmit(true, false, false, true);
+        emit YieldFarmingPool.PoolUpdated(poolId1, 5e16);
+        pool.updatePoolRewardRate(poolId1, 5e16);
+        vm.warp(block.timestamp + 100);
+
+        // Assert: 100s at 1e16 plus 100s at 5e16
+        assertEq(pool.pendingRewards(poolId1, alice), 100 * REWARD_RATE + 100 * 5e16);
     }
 
-    function test_RevertWhen_PauseNotOwner() public {
-        vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OwnableUnauthorizedAccount.selector, user1));
-        yieldFarmingPool.pause();
+    function test_updatePoolRewardRate_toZero_stopsEmission() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+        pool.updatePoolRewardRate(poolId1, 0);
+
+        // Act
+        vm.warp(block.timestamp + 1 days);
+
+        // Assert
+        assertEq(pool.pendingRewards(poolId1, alice), 0);
     }
 
-    function test_RevertWhen_UnpauseNotOwner() public {
-        yieldFarmingPool.pause();
-
-        vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OwnableUnauthorizedAccount.selector, user1));
-        yieldFarmingPool.unpause();
+    function test_updatePoolRewardRate_byNonOwner_reverts() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pool.updatePoolRewardRate(poolId1, 1);
     }
 
-    // ─── Ownable2Step ─────────────────────────────────────────────────────────
+    function test_updatePoolRewardRate_onUnknownPool_revertsWithPoolNotActive() external {
+        // Arrange
+        bytes32 unknown = keccak256("unknown");
 
-    function testOwnershipTransfer2Step() public {
-        yieldFarmingPool.transferOwnership(user1);
-
-        assertEq(yieldFarmingPool.pendingOwner(), user1);
-        assertEq(yieldFarmingPool.owner(), owner);
-
-        vm.prank(user1);
-        yieldFarmingPool.acceptOwnership();
-
-        assertEq(yieldFarmingPool.owner(), user1);
+        // Act / Assert
+        vm.expectRevert(abi.encodeWithSelector(PoolNotActive.selector, unknown));
+        pool.updatePoolRewardRate(unknown, 1);
     }
 
-    // ─── updatePoolRewardRate ─────────────────────────────────────────────────
+    function test_updatePoolRewardRate_aboveMax_revertsWithRewardRateTooHigh() external {
+        // Arrange
+        uint256 tooHigh = pool.MAX_REWARD_RATE() + 1;
 
-    function testUpdatePoolRewardRate() public {
-        uint256 newRate = REWARD_RATE * 2;
-        yieldFarmingPool.updatePoolRewardRate(poolId1, newRate);
-
-        (,, uint256 rewardRate,,,) = yieldFarmingPool.pools(poolId1);
-        assertEq(rewardRate, newRate);
+        // Act / Assert
+        vm.expectRevert(abi.encodeWithSelector(RewardRateTooHigh.selector, tooHigh));
+        pool.updatePoolRewardRate(poolId1, tooHigh);
     }
 
-    function test_RevertWhen_UpdateRewardRateNotOwner() public {
-        vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OwnableUnauthorizedAccount.selector, user1));
-        yieldFarmingPool.updatePoolRewardRate(poolId1, REWARD_RATE * 2);
+    // -------------------------------------------------------------------------
+    // pause and ownership
+    // -------------------------------------------------------------------------
+
+    function test_pause_andUnpause_toggleState() external {
+        // Arrange / Act
+        pool.pause();
+
+        // Assert
+        assertTrue(pool.paused());
+        pool.unpause();
+        assertFalse(pool.paused());
     }
 
-    function test_RevertWhen_UpdateRewardRateInactivePool() public {
-        bytes32 fakePoolId = bytes32(uint256(1));
-        vm.expectRevert(abi.encodeWithSelector(PoolNotActive.selector, fakePoolId));
-        yieldFarmingPool.updatePoolRewardRate(fakePoolId, REWARD_RATE);
+    function test_pause_byNonOwner_reverts() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pool.pause();
     }
 
-    // ─── stake ────────────────────────────────────────────────────────────────
+    function test_unpause_byNonOwner_reverts() external {
+        // Arrange
+        pool.pause();
 
-    function testStake() public {
-        uint256 amount = 1_000 * 1e18;
-
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
-
-        (uint256 userAmount,,) = yieldFarmingPool.userInfo(poolId1, user1);
-        (, uint256 totalStaked,,,,) = yieldFarmingPool.pools(poolId1);
-
-        assertEq(userAmount, amount);
-        assertEq(totalStaked, amount);
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pool.unpause();
     }
 
-    function test_RevertWhen_StakeInactivePool() public {
-        bytes32 fakePoolId = bytes32(uint256(1));
-        vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(PoolNotActive.selector, fakePoolId));
-        yieldFarmingPool.stake(fakePoolId, 1_000 * 1e18);
+    function test_transferOwnership_isTwoStep() external {
+        // Arrange / Act
+        pool.transferOwnership(alice);
+
+        // Assert
+        assertEq(pool.owner(), address(this));
+        assertEq(pool.pendingOwner(), alice);
+        vm.prank(alice);
+        pool.acceptOwnership();
+        assertEq(pool.owner(), alice);
     }
 
-    function test_RevertWhen_StakeZeroAmount() public {
-        vm.prank(user1);
+    // -------------------------------------------------------------------------
+    // stake
+    // -------------------------------------------------------------------------
+
+    function test_stake_updatesStateAndMovesTokens() external {
+        // Arrange
+        uint256 balanceBefore = stakeToken1.balanceOf(alice);
+        vm.expectEmit(true, true, false, true);
+        emit YieldFarmingPool.Staked(poolId1, alice, 100 ether);
+
+        // Act
+        _stake(alice, poolId1, 100 ether);
+
+        // Assert
+        (uint256 amount,, uint256 lastClaim, uint256 unpaid) = pool.userInfo(poolId1, alice);
+        (, uint256 totalStaked,,,,) = pool.pools(poolId1);
+        assertEq(amount, 100 ether);
+        assertEq(lastClaim, block.timestamp);
+        assertEq(unpaid, 0);
+        assertEq(totalStaked, 100 ether);
+        assertEq(pool.stakedByToken(address(stakeToken1)), 100 ether);
+        assertEq(stakeToken1.balanceOf(alice), balanceBefore - 100 ether);
+        assertEq(stakeToken1.balanceOf(address(pool)), 100 ether);
+    }
+
+    function test_stake_onUnknownPool_revertsWithPoolNotActive() external {
+        // Arrange
+        bytes32 unknown = keccak256("unknown");
+
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(PoolNotActive.selector, unknown));
+        pool.stake(unknown, 1 ether);
+    }
+
+    function test_stake_withZeroAmount_revertsWithAmountMustBePositive() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
         vm.expectRevert(AmountMustBePositive.selector);
-        yieldFarmingPool.stake(poolId1, 0);
+        pool.stake(poolId1, 0);
     }
 
-    function test_RevertWhen_StakeWhenPaused() public {
-        yieldFarmingPool.pause();
+    function test_stake_whenPaused_reverts() external {
+        // Arrange
+        pool.pause();
 
-        vm.prank(user1);
-        vm.expectRevert(EnforcedPause.selector);
-        yieldFarmingPool.stake(poolId1, 1_000 * 1e18);
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.stake(poolId1, 1 ether);
     }
 
-    function testRestakeWithExistingPosition() public {
-        uint256 firstAmount  = 1_000 * 1e18;
-        uint256 secondAmount = 500 * 1e18;
-
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, firstAmount);
-
+    function test_stake_withExistingPosition_paysPendingRewards() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
         vm.warp(block.timestamp + 100);
+        vm.expectEmit(true, true, false, true);
+        emit YieldFarmingPool.RewardClaimed(poolId1, alice, 100 * REWARD_RATE);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, secondAmount);
+        // Act
+        _stake(alice, poolId1, 500 ether);
 
-        // Rewards auto-paid on re-stake
-        assertGt(rewardToken.balanceOf(user1), 0);
-
-        (uint256 userAmount,,) = yieldFarmingPool.userInfo(poolId1, user1);
-        assertEq(userAmount, firstAmount + secondAmount);
+        // Assert
+        assertEq(rewardToken.balanceOf(alice), 100 * REWARD_RATE);
+        (uint256 amount,,,) = pool.userInfo(poolId1, alice);
+        assertEq(amount, 1500 ether);
+        assertEq(pool.pendingRewards(poolId1, alice), 0);
     }
 
-    // ─── withdraw ─────────────────────────────────────────────────────────────
+    function test_stake_inTwoPools_keepsPositionsIndependent() external {
+        // Arrange / Act
+        _stake(alice, poolId1, 100 ether);
+        _stake(alice, poolId2, 300 ether);
 
-    function testWithdrawPartial() public {
-        uint256 stakeAmount    = 1_000 * 1e18;
-        uint256 withdrawAmount = 500 * 1e18;
+        // Assert
+        (uint256 a1,,,) = pool.userInfo(poolId1, alice);
+        (uint256 a2,,,) = pool.userInfo(poolId2, alice);
+        assertEq(a1, 100 ether);
+        assertEq(a2, 300 ether);
+        assertEq(pool.stakedByToken(address(stakeToken1)), 100 ether);
+        assertEq(pool.stakedByToken(address(stakeToken2)), 300 ether);
+    }
 
-        vm.startPrank(user1);
-        yieldFarmingPool.stake(poolId1, stakeAmount);
-        vm.warp(block.timestamp + 100);
-        yieldFarmingPool.withdraw(poolId1, withdrawAmount);
+    function test_stake_withReentrantToken_revertsWithReentrancyGuard() external {
+        // Arrange
+        ReentrantStakeToken evil = new ReentrantStakeToken();
+        bytes32 evilPool = pool.createPool(address(evil), 1e16);
+        evil.setTarget(pool, evilPool);
+        evil.mint(alice, 10 ether);
+        vm.startPrank(alice);
+        evil.approve(address(pool), type(uint256).max);
+
+        // Act / Assert
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        pool.stake(evilPool, 5 ether);
         vm.stopPrank();
-
-        (uint256 userAmount,,) = yieldFarmingPool.userInfo(poolId1, user1);
-        (, uint256 totalStaked,,,,) = yieldFarmingPool.pools(poolId1);
-
-        assertEq(userAmount, stakeAmount - withdrawAmount);
-        assertEq(totalStaked, stakeAmount - withdrawAmount);
-        assertEq(stakingToken1.balanceOf(user1), 9_000 * 1e18 + withdrawAmount);
     }
 
-    function testFullWithdrawDeletesUserInfo() public {
-        uint256 amount = 1_000 * 1e18;
+    // -------------------------------------------------------------------------
+    // withdraw
+    // -------------------------------------------------------------------------
 
-        vm.startPrank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
+    function test_withdraw_partial_paysRewardsAndKeepsPosition() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
         vm.warp(block.timestamp + 100);
-        yieldFarmingPool.withdraw(poolId1, amount);
-        vm.stopPrank();
 
-        (uint256 userAmount, uint256 rewardDebt, uint256 lastClaimTime) = yieldFarmingPool.userInfo(poolId1, user1);
-        assertEq(userAmount, 0);
-        assertEq(rewardDebt, 0);
-        assertEq(lastClaimTime, 0);
+        // Act
+        vm.prank(alice);
+        pool.withdraw(poolId1, 400 ether);
+
+        // Assert
+        (uint256 amount,,,) = pool.userInfo(poolId1, alice);
+        assertEq(amount, 600 ether);
+        assertEq(rewardToken.balanceOf(alice), 100 * REWARD_RATE);
+        assertEq(stakeToken1.balanceOf(alice), 10_000 ether - 600 ether);
+        assertEq(pool.stakedByToken(address(stakeToken1)), 600 ether);
     }
 
-    function testWithdrawWorksWhenPaused() public {
-        uint256 amount = 1_000 * 1e18;
+    function test_withdraw_full_deletesUserInfo() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+        vm.warp(block.timestamp + 100);
+        vm.expectEmit(true, true, false, true);
+        emit YieldFarmingPool.Withdrawn(poolId1, alice, 1000 ether);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
+        // Act
+        vm.prank(alice);
+        pool.withdraw(poolId1, 1000 ether);
 
-        yieldFarmingPool.pause();
-
-        uint256 balanceBefore = stakingToken1.balanceOf(user1);
-
-        vm.prank(user1);
-        yieldFarmingPool.withdraw(poolId1, amount);
-
-        assertEq(stakingToken1.balanceOf(user1), balanceBefore + amount);
+        // Assert
+        (uint256 amount, uint256 debt, uint256 lastClaim, uint256 unpaid) = pool.userInfo(poolId1, alice);
+        assertEq(amount, 0);
+        assertEq(debt, 0);
+        assertEq(lastClaim, 0);
+        assertEq(unpaid, 0);
+        assertEq(stakeToken1.balanceOf(alice), 10_000 ether);
     }
 
-    function test_RevertWhen_WithdrawZeroAmount() public {
-        vm.prank(user1);
+    function test_withdraw_whenPaused_stillWorks() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+        pool.pause();
+
+        // Act
+        vm.prank(alice);
+        pool.withdraw(poolId1, 1000 ether);
+
+        // Assert
+        assertEq(stakeToken1.balanceOf(alice), 10_000 ether);
+    }
+
+    function test_withdraw_withZeroAmount_revertsWithAmountMustBePositive() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
         vm.expectRevert(AmountMustBePositive.selector);
-        yieldFarmingPool.withdraw(poolId1, 0);
+        pool.withdraw(poolId1, 0);
     }
 
-    function test_RevertWhen_WithdrawMoreThanStaked() public {
-        uint256 stakeAmount = 1_000 * 1e18;
+    function test_withdraw_moreThanStaked_revertsWithInsufficientStakedAmount() external {
+        // Arrange
+        _stake(alice, poolId1, 100 ether);
 
-        vm.startPrank(user1);
-        yieldFarmingPool.stake(poolId1, stakeAmount);
-        vm.expectRevert(abi.encodeWithSelector(InsufficientStakedAmount.selector, stakeAmount, stakeAmount + 1));
-        yieldFarmingPool.withdraw(poolId1, stakeAmount + 1);
-        vm.stopPrank();
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(InsufficientStakedAmount.selector, 100 ether, 101 ether));
+        pool.withdraw(poolId1, 101 ether);
     }
 
-    // ─── claimRewards ─────────────────────────────────────────────────────────
+    function test_withdraw_fromPoolWithoutPosition_revertsWithInsufficientStakedAmount() external {
+        // Arrange / Act / Assert
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(InsufficientStakedAmount.selector, 0, 1 ether));
+        pool.withdraw(poolId1, 1 ether);
+    }
 
-    function testStakeAndRewards() public {
-        uint256 amount = 1_000 * 1e18;
+    // -------------------------------------------------------------------------
+    // claimRewards and reward math
+    // -------------------------------------------------------------------------
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
-
+    function test_claimRewards_afterTime_paysExactRewards() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
         vm.warp(block.timestamp + 100);
+        vm.expectEmit(true, true, false, true);
+        emit YieldFarmingPool.RewardClaimed(poolId1, alice, 100 * REWARD_RATE);
 
-        assertGt(yieldFarmingPool.pendingRewards(poolId1, user1), 0);
+        // Act
+        vm.prank(alice);
+        pool.claimRewards(poolId1);
 
-        vm.prank(user1);
-        yieldFarmingPool.claimRewards(poolId1);
-
-        assertGt(rewardToken.balanceOf(user1), 0);
+        // Assert
+        assertEq(rewardToken.balanceOf(alice), 100 * REWARD_RATE);
+        assertEq(pool.pendingRewards(poolId1, alice), 0);
     }
 
-    function test_RevertWhen_ClaimNoRewards() public {
-        vm.prank(user1);
+    function test_claimRewards_twiceInSameBlock_revertsWithNoRewardsToClaim() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+        vm.warp(block.timestamp + 100);
+        vm.startPrank(alice);
+        pool.claimRewards(poolId1);
+
+        // Act / Assert
         vm.expectRevert(NoRewardsToClaim.selector);
-        yieldFarmingPool.claimRewards(poolId1);
+        pool.claimRewards(poolId1);
+        vm.stopPrank();
     }
 
-    function test_RevertWhen_ClaimWhenPaused() public {
-        uint256 amount = 1_000 * 1e18;
+    function test_claimRewards_withoutPosition_revertsWithNoRewardsToClaim() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(NoRewardsToClaim.selector);
+        pool.claimRewards(poolId1);
+    }
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
+    function test_claimRewards_onUnknownPool_revertsWithPoolNotActive() external {
+        // Arrange
+        bytes32 unknown = keccak256("unknown");
 
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(PoolNotActive.selector, unknown));
+        pool.claimRewards(unknown);
+    }
+
+    function test_claimRewards_whenPaused_reverts() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+        vm.warp(block.timestamp + 100);
+        pool.pause();
+
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        pool.claimRewards(poolId1);
+    }
+
+    function test_rewards_areProportionalToStake() external {
+        // Arrange: Alice stakes 3x Bob's amount at the same time
+        _stake(alice, poolId1, 3000 ether);
+        _stake(bob, poolId1, 1000 ether);
+
+        // Act
+        vm.warp(block.timestamp + 400);
+
+        // Assert
+        assertEq(pool.pendingRewards(poolId1, alice), 3 * 100 * REWARD_RATE);
+        assertEq(pool.pendingRewards(poolId1, bob), 1 * 100 * REWARD_RATE);
+    }
+
+    function test_rewards_whileNobodyStaked_areNotAccrued() external {
+        // Arrange
+        vm.warp(block.timestamp + 10 days);
+
+        // Act
+        _stake(alice, poolId1, 1000 ether);
         vm.warp(block.timestamp + 100);
 
-        yieldFarmingPool.pause();
-
-        vm.prank(user1);
-        vm.expectRevert(EnforcedPause.selector);
-        yieldFarmingPool.claimRewards(poolId1);
+        // Assert
+        assertEq(pool.pendingRewards(poolId1, alice), 100 * REWARD_RATE);
     }
 
-    // ─── Exact math ───────────────────────────────────────────────────────────
+    function test_rewards_inDifferentPools_useTheirOwnRates() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+        _stake(alice, poolId2, 1000 ether);
 
-    function testExactRewardCalculation() public {
-        uint256 amount = 1_000 * 1e18;
-
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount);
-
+        // Act
         vm.warp(block.timestamp + 100);
 
-        uint256 pending = yieldFarmingPool.pendingRewards(poolId1, user1);
-        assertEq(pending, 100 * REWARD_RATE);
+        // Assert
+        assertEq(pool.pendingRewards(poolId1, alice), 100 * REWARD_RATE);
+        assertEq(pool.pendingRewards(poolId2, alice), 100 * REWARD_RATE * 2);
     }
 
-    // ─── Reward cap ───────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // underfunded reward balance
+    // -------------------------------------------------------------------------
 
-    function testSafeRewardTransferCap() public {
-        MockToken tinyReward  = new MockToken("Tiny", "TRW", 0);
-        MockToken tinyStaking = new MockToken("TinyStk", "TSK", 0);
-
-        YieldFarmingPool tinyPool = new YieldFarmingPool(address(tinyReward));
-
-        tinyReward.mint(address(tinyPool), 1);
-        tinyStaking.mint(user1, 1_000 * 1e18);
-
-        bytes32 pid = tinyPool.createPool(address(tinyStaking), REWARD_RATE);
-
-        vm.prank(user1);
-        tinyStaking.approve(address(tinyPool), type(uint256).max);
-
-        vm.prank(user1);
-        tinyPool.stake(pid, 1_000 * 1e18);
-
-        vm.warp(block.timestamp + 365 days);
-
-        vm.prank(user1);
-        tinyPool.claimRewards(pid);
-
-        assertEq(tinyReward.balanceOf(user1), 1);
+    function _underfundedPool(uint256 funding_) internal returns (YieldFarmingPool p, bytes32 id) {
+        p = new YieldFarmingPool(address(rewardToken));
+        id = p.createPool(address(stakeToken1), REWARD_RATE);
+        rewardToken.transfer(address(p), funding_);
+        vm.prank(alice);
+        stakeToken1.approve(address(p), type(uint256).max);
+        vm.prank(alice);
+        p.stake(id, 1000 ether);
     }
 
-    // ─── Proportionality ──────────────────────────────────────────────────────
+    function test_claimRewards_whenUnderfunded_paysAvailableAndKeepsUnpaid() external {
+        // Arrange: 1000s at 1e16/s earns 10 tokens but only 4 are available
+        (YieldFarmingPool p, bytes32 id) = _underfundedPool(4 ether);
+        vm.warp(block.timestamp + 1000);
 
-    function testRewardsProportionalToStake() public {
-        uint256 amount1 = 1_000 * 1e18;
-        uint256 amount2 = 2_000 * 1e18;
+        // Act
+        vm.prank(alice);
+        p.claimRewards(id);
 
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, amount1);
-
-        vm.prank(user2);
-        yieldFarmingPool.stake(poolId1, amount2);
-
-        vm.warp(block.timestamp + 100);
-
-        uint256 pending1 = yieldFarmingPool.pendingRewards(poolId1, user1);
-        uint256 pending2 = yieldFarmingPool.pendingRewards(poolId1, user2);
-
-        assertApproxEqAbs(pending2, pending1 * 2, 1);
+        // Assert
+        assertEq(rewardToken.balanceOf(alice), 4 ether);
+        assertEq(p.pendingRewards(id, alice), 6 ether);
     }
 
-    // ─── Multi-user ───────────────────────────────────────────────────────────
+    function test_claimRewards_afterTopUp_paysRemainingUnpaidRewards() external {
+        // Arrange
+        (YieldFarmingPool p, bytes32 id) = _underfundedPool(4 ether);
+        vm.warp(block.timestamp + 1000);
+        vm.prank(alice);
+        p.claimRewards(id);
+        rewardToken.transfer(address(p), 100 ether);
 
-    function testMultipleUsers() public {
-        vm.prank(user1);
-        yieldFarmingPool.stake(poolId1, 1_000 * 1e18);
+        // Act
+        vm.prank(alice);
+        p.claimRewards(id);
 
-        vm.prank(user2);
-        yieldFarmingPool.stake(poolId1, 2_000 * 1e18);
-
-        vm.warp(block.timestamp + 100);
-
-        uint256 pending1 = yieldFarmingPool.pendingRewards(poolId1, user1);
-        uint256 pending2 = yieldFarmingPool.pendingRewards(poolId1, user2);
-
-        assertGt(pending1, 0);
-        assertGt(pending2, 0);
-        assertGt(pending2, pending1);
+        // Assert
+        assertEq(rewardToken.balanceOf(alice), 10 ether);
+        assertEq(p.pendingRewards(id, alice), 0);
     }
 
-    // ─── View helpers ─────────────────────────────────────────────────────────
+    function test_claimRewards_whenNoRewardBalance_revertsWithRewardBalanceDepleted() external {
+        // Arrange
+        (YieldFarmingPool p, bytes32 id) = _underfundedPool(0);
+        vm.warp(block.timestamp + 1000);
 
-    function testGetPoolEncodedData() public view {
-        bytes memory encodedData = yieldFarmingPool.getPoolEncodedData(poolId1);
-        assertGt(encodedData.length, 0);
+        // Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(RewardBalanceDepleted.selector);
+        p.claimRewards(id);
+        assertEq(p.pendingRewards(id, alice), 10 ether);
     }
 
-    function testGetUserHash() public view {
-        bytes32 h1 = yieldFarmingPool.getUserHash(poolId1, user1);
-        bytes32 h2 = yieldFarmingPool.getUserHash(poolId1, user2);
-        bytes32 h3 = yieldFarmingPool.getUserHash(poolId2, user1);
+    function test_withdraw_whenUnderfunded_returnsPrincipalAndKeepsUnpaidRewards() external {
+        // Arrange
+        (YieldFarmingPool p, bytes32 id) = _underfundedPool(0);
+        vm.warp(block.timestamp + 1000);
 
-        assertTrue(h1 != h2);
-        assertTrue(h1 != h3);
+        // Act
+        vm.prank(alice);
+        p.withdraw(id, 1000 ether);
+
+        // Assert: principal returned, rewards owed are preserved and claimable after funding
+        assertEq(stakeToken1.balanceOf(alice), 10_000 ether);
+        (uint256 amount,,, uint256 unpaid) = p.userInfo(id, alice);
+        assertEq(amount, 0);
+        assertEq(unpaid, 10 ether);
+        rewardToken.transfer(address(p), 10 ether);
+        vm.prank(alice);
+        p.claimRewards(id);
+        assertEq(rewardToken.balanceOf(alice), 10 ether);
     }
 
-    function testGetActivePools() public view {
-        bytes32[] memory active = yieldFarmingPool.getActivePools();
-        assertEq(active.length, 2);
-        assertEq(active[0], poolId1);
-        assertEq(active[1], poolId2);
-        assertEq(yieldFarmingPool.getActivePoolsCount(), 2);
+    function test_stake_whenUnderfunded_keepsUnpaidRewardsForLater() external {
+        // Arrange
+        (YieldFarmingPool p, bytes32 id) = _underfundedPool(0);
+        vm.warp(block.timestamp + 1000);
+
+        // Act
+        vm.prank(alice);
+        p.stake(id, 1 ether);
+
+        // Assert
+        assertEq(p.pendingRewards(id, alice), 10 ether);
     }
 
-    // ─── emergencyWithdraw ────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // pool that stakes the reward token
+    // -------------------------------------------------------------------------
 
-    function testEmergencyWithdraw() public {
-        stakingToken1.transfer(address(yieldFarmingPool), 1_000 * 1e18);
+    function test_rewards_whenStakingTokenIsRewardToken_neverPaidFromPrincipal() external {
+        // Arrange: pool stakes the reward token and holds no reward surplus
+        YieldFarmingPool p = new YieldFarmingPool(address(rewardToken));
+        bytes32 id = p.createPool(address(rewardToken), REWARD_RATE);
+        rewardToken.transfer(alice, 1000 ether);
+        vm.startPrank(alice);
+        rewardToken.approve(address(p), type(uint256).max);
+        p.stake(id, 1000 ether);
+        vm.warp(block.timestamp + 1000);
 
-        uint256 before = stakingToken1.balanceOf(owner);
-        yieldFarmingPool.emergencyWithdraw(address(stakingToken1), 1_000 * 1e18);
-
-        assertEq(stakingToken1.balanceOf(owner), before + 1_000 * 1e18);
+        // Act / Assert: no surplus, so the claim reverts instead of paying out of staked tokens
+        vm.expectRevert(RewardBalanceDepleted.selector);
+        p.claimRewards(id);
+        vm.stopPrank();
+        assertEq(rewardToken.balanceOf(address(p)), 1000 ether);
     }
 
-    function test_RevertWhen_EmergencyWithdrawNotOwner() public {
-        vm.prank(user1);
-        vm.expectRevert(abi.encodeWithSelector(OwnableUnauthorizedAccount.selector, user1));
-        yieldFarmingPool.emergencyWithdraw(address(rewardToken), 1);
+    function test_withdraw_whenStakingTokenIsRewardToken_paysOnlySurplusAsRewards() external {
+        // Arrange: 3 tokens of surplus on top of the principal
+        YieldFarmingPool p = new YieldFarmingPool(address(rewardToken));
+        bytes32 id = p.createPool(address(rewardToken), REWARD_RATE);
+        rewardToken.transfer(alice, 1000 ether);
+        rewardToken.transfer(address(p), 3 ether);
+        vm.startPrank(alice);
+        rewardToken.approve(address(p), type(uint256).max);
+        p.stake(id, 1000 ether);
+        vm.warp(block.timestamp + 1000);
+
+        // Act
+        p.withdraw(id, 1000 ether);
+        vm.stopPrank();
+
+        // Assert: principal back plus only the 3 tokens of surplus, 7 remain unpaid
+        assertEq(rewardToken.balanceOf(alice), 1003 ether);
+        assertEq(rewardToken.balanceOf(address(p)), 0);
+        (,,, uint256 unpaid) = p.userInfo(id, alice);
+        assertEq(unpaid, 7 ether);
+    }
+
+    // -------------------------------------------------------------------------
+    // emergencyWithdraw
+    // -------------------------------------------------------------------------
+
+    function test_emergencyWithdraw_ofUnrelatedToken_sendsToOwnerAndEmits() external {
+        // Arrange
+        MockToken stray = new MockToken("Stray", "STR", 10);
+        assertTrue(stray.transfer(address(pool), 5 ether));
+        vm.expectEmit(true, false, false, true);
+        emit YieldFarmingPool.EmergencyWithdrawn(address(stray), 5 ether);
+
+        // Act
+        pool.emergencyWithdraw(address(stray), 5 ether);
+
+        // Assert
+        assertEq(stray.balanceOf(address(pool)), 0);
+    }
+
+    function test_emergencyWithdraw_ofUnspentRewards_succeeds() external {
+        // Arrange
+        uint256 ownerBefore = rewardToken.balanceOf(address(this));
+
+        // Act
+        pool.emergencyWithdraw(address(rewardToken), FUNDING);
+
+        // Assert
+        assertEq(rewardToken.balanceOf(address(this)), ownerBefore + FUNDING);
+    }
+
+    function test_emergencyWithdraw_ofStakedTokens_revertsWithAmountExceedsWithdrawable() external {
+        // Arrange
+        _stake(alice, poolId1, 1000 ether);
+
+        // Act / Assert
+        vm.expectRevert(abi.encodeWithSelector(AmountExceedsWithdrawable.selector, 1, 0));
+        pool.emergencyWithdraw(address(stakeToken1), 1);
+    }
+
+    function test_emergencyWithdraw_ofStakedTokensSurplus_onlyAllowsDonatedAmount() external {
+        // Arrange: someone donates 10 tokens on top of the staked principal
+        _stake(alice, poolId1, 1000 ether);
+        assertTrue(stakeToken1.transfer(address(pool), 10 ether));
+
+        // Act
+        pool.emergencyWithdraw(address(stakeToken1), 10 ether);
+
+        // Assert
+        assertEq(stakeToken1.balanceOf(address(pool)), 1000 ether);
+        vm.expectRevert(abi.encodeWithSelector(AmountExceedsWithdrawable.selector, 1, 0));
+        pool.emergencyWithdraw(address(stakeToken1), 1);
+    }
+
+    function test_emergencyWithdraw_byNonOwner_reverts() external {
+        // Arrange / Act / Assert
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        pool.emergencyWithdraw(address(rewardToken), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // views
+    // -------------------------------------------------------------------------
+
+    function test_getPoolEncodedData_returnsPackedFields() external view {
+        // Arrange
+        (address t, uint256 total, uint256 rate, uint256 last, uint256 rpt, bool active) = pool.pools(poolId1);
+
+        // Act / Assert
+        assertEq(pool.getPoolEncodedData(poolId1), abi.encodePacked(t, total, rate, last, rpt, active));
+    }
+
+    function test_getUserHash_matchesDomainSeparatedHash() external view {
+        // Assert
+        assertEq(pool.getUserHash(poolId1, alice), keccak256(abi.encodePacked(poolId1, alice, "YIELD_FARMING_USER")));
+    }
+
+    function test_getActivePools_returnsAllPoolIds() external view {
+        // Arrange
+        bytes32[] memory ids = pool.getActivePools();
+
+        // Assert
+        assertEq(ids.length, 2);
+        assertEq(ids[0], poolId1);
+        assertEq(ids[1], poolId2);
     }
 }
